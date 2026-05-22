@@ -1,0 +1,47 @@
+[package]
+name = "usbws"
+version = "0.1.0"
+edition = "2021"
+description = "Tunnel a serial port between two machines over the encrypted ws_server relay (protocol v2)."
+
+[dependencies]
+# crypto (same primitives as ws_server / wschat reference client)
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = "2"
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+blake3 = "1"
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+
+# runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "io-std", "io-util", "signal", "fs", "net"] }
+
+# ws client with TLS (wss:// supported; plain ws:// used by default)
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+anyhow = "1"
+
+# serial port (raw access for `share`). default-features off to drop the
+# libudev dependency — we open ports by path, never enumerate them.
+# Optional: only pulled in by the `serial` feature (Android builds drop it,
+# because Bionic libc has no openpty and serial mode is not needed there).
+serialport = { version = "4", default-features = false, optional = true }
+
+# pty creation + termios for `attach`. Optional, same reason as serialport.
+nix = { version = "0.29", features = ["term", "fs"], optional = true }
+
+[features]
+# serial mode (share/attach) needs serialport + nix (openpty/termios).
+# Default on for host builds; disable with --no-default-features for Android,
+# whose Bionic libc lacks openpty and where only the TCP tunnel is wanted.
+default = ["serial"]
+serial = ["dep:serialport", "dep:nix"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

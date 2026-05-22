@@ -1,0 +1,6 @@
+# Rust build output
+/target
+
+# Local identity (per-machine keypair, generated at first run) — never commit
+*.identity
+identity
