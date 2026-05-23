@@ -181,6 +181,162 @@ pub async fn run_tcp_connect(target: &str, peer: Peer, nick: &str) -> anyhow::Re
     session_loop(ctx, out_rx, &k_s2c, nick, Some(target.to_string())).await
 }
 
+/// `tcp-connect --accept`: capability "accept-incoming" mode.
+///
+/// Like `tcp-connect`, this is the gate side that dials a fixed `target` (e.g.
+/// the local usbipd on 127.0.0.1:3240). The difference: it does NOT pre-specify
+/// a peer. It listens on its own identity and accepts a connection from anyone
+/// who knows ITS invite — learning the initiator's keys from the relay's
+/// CMD_INTRO_FROM (see proto::decode_intro_from). The authorized-keys table
+/// (see `authorized` module) decides who is allowed:
+///   - empty/missing table → trust-on-first-use (first introducer is accepted
+///     and appended; knowing the invite == being the owner);
+///   - non-empty table → only listed initiators are accepted.
+///
+/// Once an initiator is accepted, the rest of the session is identical to
+/// `tcp-connect`: same data path, same dial-on-OPEN behavior.
+pub async fn run_tcp_connect_accept(target: &str, nick: &str) -> anyhow::Result<()> {
+    let (me, created) = idfile::load_or_create()?;
+    if created {
+        eprintln!("[usbws] created identity at {}", idfile::identity_path().display());
+    }
+
+    // Validate the target eagerly so a typo fails fast rather than on first OPEN.
+    if target.rsplit_once(':').is_none() {
+        anyhow::bail!("target must be host:port (got {target:?})");
+    }
+
+    eprintln!(
+        "[usbws] tcp-connect --accept → {} me={} (waiting for an authorized initiator)",
+        target,
+        hex::encode(me.id),
+    );
+    eprintln!("[usbws] my invite (give to the initiator): {}", make_qr(&me, nick));
+    {
+        let table = authorized::load().unwrap_or_default();
+        if table.is_empty() {
+            eprintln!(
+                "[usbws] authorized table empty/missing ({}) — trust-on-first-use",
+                authorized::authorized_path().display()
+            );
+        } else {
+            eprintln!("[usbws] authorized initiators: {}", table.len());
+        }
+    }
+
+    // Pre-session: connect + handshake, then wait for an inbound CMD_INTRO_FROM
+    // identifying an initiator. This reconnect loop survives relay blips while
+    // we have no peer yet.
+    let relay = Relay::from_env();
+    let shared = x25519(me.x_priv, relay.server_x_pub);
+    let (_k_c2s, k_s2c) = derive_session(&shared);
+
+    let peer = 'wait: loop {
+        let mut ws = match relay::connect_and_handshake(&relay, &me, &k_s2c).await {
+            Some(ws) => ws,
+            None => {
+                eprintln!("[usbws] relay unavailable; retry in 5s");
+                tokio::select! {
+                    _ = relay::backoff(5) => continue 'wait,
+                    _ = tokio::signal::ctrl_c() => return Ok(()),
+                }
+            }
+        };
+        eprintln!("[usbws] relay connected; awaiting an initiator (no fixed peer)…");
+
+        loop {
+            tokio::select! {
+                msg = ws.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(b))) => {
+                            // Only server-frames (e.g. INTRO_FROM, PEER_ONLINE)
+                            // are meaningful before we have a peer; a peer frame
+                            // can't be decrypted yet (we don't know the sender).
+                            if let Some(inner) = decode_server_frame(
+                                &b, &k_s2c, &me.x_priv, &relay.server_x_pub, &relay.server_ed_vk,
+                            ) {
+                                if inner.len() >= 3 && inner[2] == CMD_INTRO_FROM {
+                                    match decode_intro_from(&inner[3..]) {
+                                        Ok(p) => {
+                                            if let Some(p) = authorize_initiator(p) {
+                                                let _ = ws.close(None).await;
+                                                break 'wait p;
+                                            }
+                                            // rejected — keep waiting for another
+                                        }
+                                        Err(e) => eprintln!("[usbws] bad intro_from: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }
+                        Some(Ok(Message::Close(_))) | None => {
+                            eprintln!("[usbws] relay closed; reconnecting in 3s");
+                            break;
+                        }
+                        Some(Err(e)) => { eprintln!("[usbws] ws error: {e}; reconnecting in 3s"); break; }
+                        _ => {}
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => { let _ = ws.close(None).await; return Ok(()); }
+            }
+        }
+        relay::backoff(3).await;
+    };
+
+    eprintln!(
+        "[usbws] accepted initiator {} ({}); bridging to {}",
+        hex::encode(peer.id),
+        peer.nick,
+        target,
+    );
+
+    // From here on it's a normal tcp-connect session against the learned peer.
+    let (ctx, out_rx, k_s2c) = build_ctx(me, peer);
+    session_loop(ctx, out_rx, &k_s2c, nick, Some(target.to_string())).await
+}
+
+/// Decide whether an introducing initiator is allowed, applying the
+/// authorized-table policy (TOFU when empty, allowlist when non-empty). On
+/// acceptance returns Some(peer) (and appends to the table under TOFU); on
+/// rejection logs and returns None.
+fn authorize_initiator(peer: Peer) -> Option<Peer> {
+    let table = match authorized::load() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[usbws] cannot read authorized table: {e}; rejecting");
+            return None;
+        }
+    };
+    if table.is_empty() {
+        // Trust-on-first-use: accept and remember this initiator.
+        eprintln!(
+            "[usbws] TOFU: authorizing first initiator {} ({})",
+            hex::encode(peer.id),
+            peer.nick,
+        );
+        if let Err(e) = authorized::add(&peer.x_pub, &peer.nick) {
+            eprintln!("[usbws] warning: could not persist authorization: {e}");
+        }
+        Some(peer)
+    } else if authorized::contains(&table, &peer.x_pub) {
+        eprintln!(
+            "[usbws] authorized initiator {} ({}) — accepting",
+            hex::encode(peer.id),
+            peer.nick,
+        );
+        Some(peer)
+    } else {
+        eprintln!(
+            "[usbws] REJECTED unauthorized initiator x_pub={} id={} ({})",
+            hex::encode(peer.x_pub),
+            hex::encode(peer.id),
+            peer.nick,
+        );
+        None
+    }
+}
+
 // ============================== relay session ==============================
 
 /// Build the shared context, out queue, and session keys in one place.

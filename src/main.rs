@@ -28,6 +28,7 @@
 //!   USBWS_NICK            our display name (default "usbws")
 //!   USBWS_IDENTITY        identity file path (default ~/.config/usbws/identity)
 
+mod authorized;
 mod idfile;
 mod proto;
 mod relay;
@@ -136,6 +137,17 @@ USAGE:\n\
       On a peer's request, dial host:port and proxy bytes back (e.g. usbipd\n\
       side: usbws tcp-connect 127.0.0.1:3240 --peer K0...).\n\
 \n\
+  usbws tcp-connect <host:port> --accept\n\
+      Capability mode: no fixed peer. Listen on our own identity and accept\n\
+      a connection from anyone who knows OUR invite, learning the initiator's\n\
+      key from the handshake. Gated by the authorized table (TOFU if empty).\n\
+\n\
+  usbws authorized\n\
+      Print the authorized-initiators table (capability list).\n\
+\n\
+  usbws authorize <invite K0...>\n\
+      Add an initiator (by invite) to the authorized table.\n\
+\n\
 ENV:\n\
   USBWS_WS_URL  USBWS_SERVER_X_PUB  USBWS_SERVER_ED_PUB\n\
   USBWS_PEER (invite)  USBWS_NICK  USBWS_IDENTITY"
@@ -216,8 +228,37 @@ async fn main() -> anyhow::Result<()> {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| usage());
-            let peer = resolve_peer(&cli, None)?;
-            tcp::run_tcp_connect(&target, peer, &nick).await
+            // Capability "accept-incoming" mode: no fixed peer; accept whoever
+            // connects knowing our invite (gated by the authorized table).
+            if cli.flags.contains_key("accept") {
+                tcp::run_tcp_connect_accept(&target, &nick).await
+            } else {
+                let peer = resolve_peer(&cli, None)?;
+                tcp::run_tcp_connect(&target, peer, &nick).await
+            }
+        }
+        // Print the authorized-initiators table (capability list).
+        "authorized" => {
+            authorized::print_table()?;
+            Ok(())
+        }
+        // Add an initiator to the authorized table from its invite ("K0...").
+        "authorize" => {
+            let cli = Cli::parse(&args[2..]);
+            let invite = cli
+                .flag("peer")
+                .map(|s| s.to_string())
+                .or_else(|| cli.positionals.first().cloned())
+                .unwrap_or_else(|| usage());
+            let p = decode_qr(&invite)?;
+            authorized::add(&p.x_pub, &p.nick)?;
+            eprintln!(
+                "[usbws] authorized {} ({}) — written to {}",
+                hex::encode(p.id),
+                p.nick,
+                authorized::authorized_path().display(),
+            );
+            Ok(())
         }
         _ => usage(),
     }

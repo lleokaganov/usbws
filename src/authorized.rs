@@ -6,9 +6,9 @@
 //! module decides *which* initiators are allowed:
 //!
 //!   - File `~/.config/usbws/authorized` (alongside the identity file; honors
-//!     $USBWS_IDENTITY's directory). One initiator per line:
-//!         <x_pub_hex64> [optional nick...]
-//!     Lines starting with '#' and blank lines are ignored.
+//!     $USBWS_IDENTITY's directory). One initiator per line, formatted as
+//!     `<x_pub_hex64> [optional nick...]`. Lines starting with '#' and blank
+//!     lines are ignored.
 //!   - EMPTY or MISSING file  → trust-on-first-use (TOFU): the first initiator
 //!     who knows our invite is accepted and appended (knowing the invite ==
 //!     being the owner). Several owners = several lines.
