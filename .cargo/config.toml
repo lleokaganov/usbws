@@ -1,0 +1,5 @@
+# Android arm64 cross-build: use the NDK 27 clang as linker. Bionic libc has no
+# openpty / no libudev, so the build must turn off the `serial` feature
+# (--no-default-features), leaving only the TCP-tunnel and ws bits.
+[target.aarch64-linux-android]
+linker = "/home/lleo/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
