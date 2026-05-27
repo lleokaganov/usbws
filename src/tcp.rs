@@ -119,6 +119,8 @@ pub async fn run_tcp_listen(port: u16, peer: Peer, nick: &str) -> anyhow::Result
     );
     eprintln!("[usbws] my invite: {}", make_qr(&me, nick));
 
+    crate::stat::spawn_ticker();
+
     let (ctx, out_rx, k_s2c) = build_ctx(me, peer);
 
     // Acceptor task: allocate conn_id, register a socket-writer channel, spawn
@@ -176,6 +178,8 @@ pub async fn run_tcp_connect(target: &str, peer: Peer, nick: &str) -> anyhow::Re
         peer.nick
     );
     eprintln!("[usbws] my invite: {}", make_qr(&me, nick));
+
+    crate::stat::spawn_ticker();
 
     let (ctx, out_rx, k_s2c) = build_ctx(me, peer);
     session_loop(ctx, out_rx, &k_s2c, nick, Some(target.to_string())).await
@@ -290,6 +294,8 @@ pub async fn run_tcp_connect_accept(target: &str, nick: &str) -> anyhow::Result<
         peer.nick,
         target,
     );
+
+    crate::stat::spawn_ticker();
 
     // From here on it's a normal tcp-connect session against the learned peer.
     let (ctx, out_rx, k_s2c) = build_ctx(me, peer);
@@ -531,6 +537,12 @@ async fn spawn_connection(ctx: Arc<Ctx>, conn_id: u8, sock: TcpStream) {
         while let Some(msg) = sock_rx.recv().await {
             match msg {
                 WrMsg::Data(bytes) => {
+                    // RX from the user's perspective: peer pushed payload that
+                    // we now hand off to the local socket.
+                    crate::stat::RX_BYTES.fetch_add(
+                        bytes.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if wr.write_all(&bytes).await.is_err() {
                         break;
                     }
@@ -553,6 +565,12 @@ async fn spawn_connection(ctx: Arc<Ctx>, conn_id: u8, sock: TcpStream) {
             match rd.read(&mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(n) => {
+                    // TX from the user's perspective: socket gave us bytes
+                    // that we now forward up to the peer over the relay.
+                    crate::stat::TX_BYTES.fetch_add(
+                        n as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     // Prefix the conn_id, then ship as CMD_TCP_DATA.
                     let mut body = Vec::with_capacity(1 + n);
                     body.push(conn_id);

@@ -32,6 +32,7 @@ mod authorized;
 mod idfile;
 mod proto;
 mod relay;
+mod stat;
 mod tcp;
 
 use std::env;
